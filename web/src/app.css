@@ -500,6 +500,11 @@ kbd {
   align-items: center;
   gap: 8px;
 }
+.tools-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
 /* Candidates or Compare, over the gate strip. Both canvases stay mounted. */
 .inspector-body {
   position: relative;

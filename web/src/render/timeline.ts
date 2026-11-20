@@ -24,6 +24,12 @@
 // data changes, so sweeping costs a blit, a marker and the readout, not a
 // redraw of the whole path. Hovering a branch lights it and previews its
 // text; a click makes it the viewed path (local: no command to the engine).
+//
+// Zoom: the wheel (or a pinch) zooms the position axis around the pointer,
+// shift+wheel pans; the window is timeline-zoom.ts. Everything on the axis
+// (traces, prompt, ticks, tree, selection) is laid out through xOf(), which
+// knows the window, and clipped to the plot area. exportSvg() / exportPng()
+// save what is on screen (timeline-svg.ts).
 
 import { ORIGIN_USER, type VocabEntry } from '../source/frames';
 import type { Branch, Slot, Store } from '../store/store';
@@ -47,9 +53,12 @@ import {
   type MapLine,
   type StopGlyph,
 } from './minimap';
+import { svgToPngBlob } from './export';
 import { Surface } from './surface';
 import { fillTabular, tabularWidth } from './tabular';
 import { COLOR, MODEL_COLOR, SIZE, font, rgba, roundRect, uiFont } from './theme';
+import { buildTimelineSvg, type SvgBandLabel, type SvgLegendItem, type SvgSeries, type SvgTree } from './timeline-svg';
+import { FIT, panWindow, resolveWindow, tickEvery, tickIndices, zoomWindow, type ZoomWindow } from './timeline-zoom';
 
 const PAD_X = 14;
 const HEAD_Y = 12; // the header line
@@ -105,6 +114,16 @@ export class TimelinePanel {
   private bottom = TOP;
   private bands: Bands = timelineBands(0, TOP, 0);
   private span = MIN_SPAN; // positions across the axis: the path and the branch tips
+  private win: ZoomWindow = FIT; // what the user asked for
+  private winEpoch = -1; // the store's pathEpoch the window belongs to
+  private lo = 0; // the window as laid out: axis units at the left edge
+  private vis = MIN_SPAN; // and the positions across it
+  // What the last trace drew, kept for exportSvg().
+  private bandLabels: SvgBandLabel[] = [];
+  private guideYs = { solid: [] as number[], dotted: [] as number[] };
+  private seriesRecs: SeriesRec[] = [];
+  private legend: SvgLegendItem[] = [];
+  private tree: SvgTree = emptyTree(0, '');
   // The halo of the selection line, centred on x = 0 (built once).
   private readonly selGlow: CanvasGradient;
 
@@ -146,6 +165,21 @@ export class TimelinePanel {
     g.addColorStop(1, 'rgba(0,0,0,0)');
     this.selGlow = g;
 
+    canvas.addEventListener(
+      'wheel',
+      (e) => {
+        e.preventDefault();
+        const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? this.surface.h : 1;
+        const dx = e.deltaX * unit;
+        const dy = e.deltaY * unit;
+        if (e.shiftKey || Math.abs(dx) > Math.abs(dy)) {
+          this.pan((Math.abs(dx) > Math.abs(dy) ? dx : dy) / (this.step() || 1));
+        } else {
+          this.zoomBy(Math.exp(-dy * (e.ctrlKey ? 0.01 : 0.0015)), e.offsetX);
+        }
+      },
+      { passive: false },
+    );
     canvas.addEventListener('mousemove', (e) => {
       this.pointerX = e.offsetX;
       this.pointerY = e.offsetY;
@@ -182,11 +216,7 @@ export class TimelinePanel {
     const s = this.store;
     const n = s.path.length;
 
-    const key = `${s.pathEpoch}:${n}:${s.framesApplied}:${s.front}:${s.twoModels}:${s.follow}:${sf.canvas.width}:${sf.canvas.height}`;
-    if (key !== this.traceKey) {
-      this.traceKey = key;
-      this.drawTrace();
-    }
+    this.refresh();
     ctx.drawImage(this.trace, 0, 0, sf.w, sf.h);
 
     // The branch under the pointer, lit: it is what a click would view.
@@ -207,6 +237,127 @@ export class TimelinePanel {
     if (sel >= 0 && sel < n && this.bottom > this.top) {
       const pinned = this.view.pinnedIndex() !== null;
       const x = Math.round(this.xOf(sel)) + 0.5;
+      if (x >= this.left - 1 && x <= this.plotRight() + 1) this.selection(sel, pinned, x);
+    }
+    if (this.hoverBranch >= 0) this.branchChip();
+  }
+
+  // Zooms the position axis by `factor` (above 1 in, below 1 out) around
+  // `anchorX` (CSS px; the middle of the plot by default).
+  zoomBy(factor: number, anchorX?: number): void {
+    const w = this.axisW();
+    const frac = anchorX === undefined || !(w > 0) ? 0.5 : (anchorX - this.left) / w;
+    this.setWindow(zoomWindow(this.win, this.span, factor, frac));
+  }
+
+  // Back to the whole axis.
+  zoomFit(): void {
+    this.setWindow(FIT);
+  }
+
+  // How far the axis is zoomed in: 1 is the whole axis.
+  get zoomLevel(): number {
+    return this.span / this.vis;
+  }
+
+  // The Timeline as it is on screen, as a self-contained SVG document.
+  exportSvg(): string {
+    const sf = this.surface;
+    if (sf.w < 1 || sf.h < 1) throw new Error('The Timeline has no size yet: open its tab first.');
+    this.refresh();
+    const s = this.store;
+    const n = s.path.length;
+    const series: SvgSeries[] = this.seriesRecs.map((r) => ({
+      id: r.id,
+      color: r.color,
+      base: r.base,
+      far: r.far,
+      areaAlpha: r.color === COLOR.high ? 0.22 : 0.36,
+      y: Array.from({ length: n }, (_, i) => {
+        const v = r.value(i);
+        return v === undefined ? undefined : r.y(v);
+      }),
+    }));
+    const disagreements: number[] = [];
+    if (this.two) for (let i = 1; i < n; i++) if (s.disagrees(i)) disagreements.push(i);
+    const a = Math.max(0, Math.floor(this.lo));
+    const b = Math.max(a, Math.min(n - 1, Math.ceil(this.lo + this.vis) - 1));
+    const range = n > 0 ? `positions ${a} to ${b} of ${n}` : 'no positions yet';
+    const models = (s.hello?.models ?? []).map((m) => `${m.slot}: ${m.name}`);
+    const zoom = this.zoomLevel > 1.005 ? ` · zoom ${this.zoomLevel.toFixed(1)}x` : '';
+    return buildTimelineSvg({
+      width: sf.w,
+      height: sf.h,
+      title: 'inside-llm timeline',
+      desc: `Entropy and divergence per position of the viewed path, and its tree of branches. ${models.join(', ')}. ${range}${zoom}.`,
+      caption: [...models, range].join(' · ') + zoom,
+      padX: PAD_X,
+      left: this.left,
+      right: this.plotRight(),
+      top: this.top,
+      bottom: this.bottom,
+      lo: this.lo,
+      vis: this.vis,
+      step: this.step(),
+      span: this.span,
+      count: n,
+      promptLength: s.promptLength,
+      markY: this.bands.markY,
+      tickEvery: tickEvery(this.step(), TICK_MIN_PX),
+      tickY: this.bottom + AXIS_H / 2 + 3,
+      bandLabels: this.bandLabels,
+      guides: this.guideYs,
+      series,
+      disagreements,
+      legend: this.legend,
+      tree: this.tree,
+    });
+  }
+
+  // The same, rasterised at `scale` times its CSS size.
+  exportPng(scale = 2): Promise<Blob> {
+    const svg = this.exportSvg();
+    return svgToPngBlob(svg, this.surface.w, this.surface.h, scale);
+  }
+
+  dispose(): void {
+    this.surface.dispose();
+  }
+
+  // ----------------------------------------------------------- internal
+
+  // Lays the trace out again when what it is drawn from has changed.
+  private refresh(): void {
+    const s = this.store;
+    const sf = this.surface;
+    // A new path (another session, a branch, a new run) starts from the whole axis:
+    // a window left over from the old one could show only its last few positions.
+    if (s.pathEpoch !== this.winEpoch) {
+      this.winEpoch = s.pathEpoch;
+      this.win = FIT;
+    }
+    const w = this.win;
+    const key = `${s.pathEpoch}:${s.path.length}:${s.framesApplied}:${s.front}:${s.twoModels}:${s.follow}:${sf.canvas.width}:${sf.canvas.height}:${w.vis}:${w.lo}:${w.atEnd}`;
+    if (key === this.traceKey) return;
+    this.traceKey = key;
+    this.drawTrace();
+  }
+
+  private setWindow(w: ZoomWindow): void {
+    if (w === this.win) return;
+    this.win = w;
+    this.store.dirty.timeline = true;
+  }
+
+  private pan(units: number): void {
+    this.setWindow(panWindow(this.win, this.span, units));
+  }
+
+  // The selection: its line, the dots on the traces and the readout.
+  private selection(sel: number, pinned: boolean, x: number): void {
+    const ctx = this.surface.ctx;
+    const n = this.store.path.length;
+    if (sel >= 0 && sel < n && this.bottom > this.top) {
       this.selectionLine(x, pinned);
       if (this.two) this.selectionTwo(sel, x);
       else this.selectionOne(sel, x);
@@ -217,14 +368,7 @@ export class TimelinePanel {
       ctx.fill();
       this.readout(sel, pinned, x);
     }
-    if (this.hoverBranch >= 0) this.branchChip();
   }
-
-  dispose(): void {
-    this.surface.dispose();
-  }
-
-  // ----------------------------------------------------------- internal
 
   // A white line across the traces with a soft halo; brighter when pinned.
   private selectionLine(x: number, pinned: boolean): void {
@@ -385,7 +529,7 @@ export class TimelinePanel {
   // Finds the branch under the pointer and, when it changes, builds its lit
   // line and its chip. Returns whether anything changed.
   private updateHover(): boolean {
-    const i = this.pointerX < 0 ? -1 : hitBranch(this.mapLines, this.pointerX, this.pointerY, this.mapY);
+    const i = this.pointerX < this.left ? -1 : hitBranch(this.mapLines, this.pointerX, this.pointerY, this.mapY);
     if (i === this.hoverBranch) return false;
     this.hoverBranch = i;
     this.hoverPath = null;
@@ -423,6 +567,7 @@ export class TimelinePanel {
   private drawPulse(pulse: Pulse): void {
     const ctx = this.surface.ctx;
     const x = Math.round(this.xOf(pulse.index));
+    if (x < this.left - 6 || x > this.plotRight() + 6) return;
     const y = this.top - 4;
     const h = this.bottom - this.top + 8;
     ctx.fillStyle = COLOR.dis;
@@ -437,12 +582,29 @@ export class TimelinePanel {
     ctx.globalAlpha = 1;
   }
 
+  // Width of the axis, and where the plot area ends (the axis stops
+  // END_ROOM before it, for a stop glyph).
+  private axisW(): number {
+    return Math.max(0, this.surface.w - PAD_X - END_ROOM - this.left);
+  }
+
+  private plotRight(): number {
+    return this.surface.w - PAD_X;
+  }
+
   private step(): number {
-    return Math.max(0, this.surface.w - PAD_X - END_ROOM - this.left) / this.span;
+    return this.axisW() / this.vis;
   }
 
   private xOf(i: number): number {
-    return this.left + (i + 0.5) * this.step();
+    return this.left + (i + 0.5 - this.lo) * this.step();
+  }
+
+  // Keeps what follows inside the plot area, off the band labels.
+  private clipPlot(ctx: CanvasRenderingContext2D): void {
+    ctx.beginPath();
+    ctx.rect(this.left, 0, this.plotRight() - this.left, this.surface.h);
+    ctx.clip();
   }
 
   // One model: entropy over the whole box.
@@ -468,7 +630,7 @@ export class TimelinePanel {
     if (n === 0) return null;
     const step = this.step();
     if (!(step > 0)) return null;
-    const i = Math.floor((x - this.left) / step);
+    const i = Math.floor((x - this.left) / step + this.lo);
     return Math.max(0, Math.min(n - 1, i));
   }
 
@@ -486,17 +648,30 @@ export class TimelinePanel {
     // The axis holds the path and every branch tip, at the same x for both.
     const branches = s.branches();
     this.span = axisSpan(s.path.length, branches);
+    const win = resolveWindow(this.win, this.span);
+    this.lo = win.lo;
+    this.vis = win.vis;
+    this.bandLabels = [];
+    this.seriesRecs = [];
+    this.legend = [];
     // Band labels in a column on the left; the traces start after it.
     ctx.font = uiFont(11);
     this.left = Math.ceil(PAD_X + 8 + ctx.measureText('divergence').width + 14);
 
-    // The tree's rows first: its height takes from the traces.
+    // The tree's rows first: its height takes from the traces. They are
+    // assigned on the whole axis, so zooming does not move the layout.
+    const fitStep = this.axisW() / this.span;
+    const fitX = (i: number): number => this.left + (i + 0.5) * fitStep;
+    const fitSpans = branches.map((b) => {
+      const x0 = fitX(b.fromIndex);
+      return [x0, Math.max(fitX(b.tipDepth), x0 + CURVE_W)] as const;
+    });
     const spans = branches.map((b) => {
       const x0 = this.xOf(b.fromIndex);
       return [x0, Math.max(this.xOf(b.tipDepth), x0 + CURVE_W)] as const;
     });
     const room = sf.h - TOP - AXIS_H - MIN_TRACES;
-    const rows = assignRows(spans, maxRows(room), 4);
+    const rows = assignRows(fitSpans, maxRows(room), 4);
     const treeH = treeHeight(rowsUsed(rows));
 
     const box = traceBox(sf.h, TOP, AXIS_H + treeH, this.two ? MAX_TWO : MAX_ONE);
@@ -531,15 +706,20 @@ export class TimelinePanel {
       disTick(ctx, x + 1, HEAD_Y + 4);
       ctx.fillStyle = COLOR.muted;
       ctx.fillText('picks differ', x + 8, HEAD_Y);
+      this.legend.push({ kind: 'differ', x: x + 1, y: HEAD_Y, text: 'picks differ' });
       x += 8 + ctx.measureText('picks differ').width + 18;
     }
     if (branches.some((b) => s.origin[b.child] === ORIGIN_USER) || s.path.some((n) => s.origin[n] === ORIGIN_USER)) {
       diamond(ctx, x + 4, HEAD_Y);
       ctx.fillStyle = COLOR.muted;
       ctx.fillText('your branch', x + 13, HEAD_Y);
+      this.legend.push({ kind: 'user', x, y: HEAD_Y, text: 'your branch' });
       x += 13 + ctx.measureText('your branch').width + 18;
     }
-    const hint = 'Hover to inspect · click to pin · click a branch to view it';
+    const hint =
+      this.vis < this.span - 1e-6
+        ? `zoom ${(this.span / this.vis).toFixed(1)}x · wheel to zoom, shift+wheel to pan`
+        : 'Hover to inspect · click to pin · click a branch to view it';
     const hw = ctx.measureText(hint).width;
     if (w - PAD_X - hw - 18 > x + 24) {
       ctx.fillStyle = COLOR.low;
@@ -552,6 +732,7 @@ export class TimelinePanel {
 
   // A band's name and scale in the left column, with a glowing swatch.
   private bandLabel(ctx: CanvasRenderingContext2D, y0: number, y1: number, swatch: string, name: string, scale: string): void {
+    this.bandLabels.push({ y0, y1, color: swatch, name, scale });
     const mid = (y0 + y1) / 2;
     const tall = y1 - y0 >= 30;
     const sh = tall ? 22 : 10;
@@ -573,6 +754,7 @@ export class TimelinePanel {
 
   // Thin guides across the traces: solid at the bases, dotted at half scale.
   private guides(ctx: CanvasRenderingContext2D, solid: readonly number[], dotted: readonly number[]): void {
+    this.guideYs = { solid: [...solid], dotted: [...dotted] };
     const x0 = this.left;
     const x1 = this.surface.w - PAD_X;
     ctx.lineWidth = 1;
@@ -601,9 +783,10 @@ export class TimelinePanel {
     const prompt = this.store.promptLength;
     if (prompt <= 0) return;
     const step = this.step();
-    const x1 = Math.round(this.left + prompt * step) + 0.5;
+    const x0 = this.left - this.lo * step; // the clip keeps what is left of the plot out
+    const x1 = Math.round(this.left + (prompt - this.lo) * step) + 0.5;
     ctx.fillStyle = PROMPT_FILL;
-    ctx.fillRect(this.left, this.top, x1 - this.left, this.bottom - this.top);
+    ctx.fillRect(x0, this.top, x1 - x0, this.bottom - this.top);
     ctx.strokeStyle = COLOR.lineStrong;
     ctx.lineWidth = 1;
     ctx.setLineDash(DASH);
@@ -612,10 +795,10 @@ export class TimelinePanel {
     ctx.lineTo(x1, this.bottom);
     ctx.stroke();
     ctx.setLineDash(NO_DASH);
-    if (prompt * step > 60) {
+    if (Math.min(x1, this.plotRight()) - Math.max(x0, this.left) > 60) {
       ctx.font = uiFont(10.5, 500);
       ctx.fillStyle = COLOR.unlikely;
-      ctx.fillText('prompt', this.left + 8, this.top + 10);
+      ctx.fillText('prompt', Math.max(x0, this.left) + 8, this.top + 10);
     }
   }
 
@@ -623,16 +806,13 @@ export class TimelinePanel {
   private drawTicks(ctx: CanvasRenderingContext2D): void {
     const step = this.step();
     if (!(step > 0) || this.bottom <= this.top) return;
-    let every = 1;
-    for (const k of [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000]) {
-      every = k;
-      if (k * step >= TICK_MIN_PX) break;
-    }
+    const every = tickEvery(step, TICK_MIN_PX);
     const y = this.bottom + AXIS_H / 2 + 3;
     ctx.font = font(10);
     ctx.textAlign = 'center';
-    for (let i = 0; i < this.span; i += every) {
+    for (const i of tickIndices(this.lo, this.vis, every, this.span)) {
       const x = this.xOf(i);
+      if (x < this.left || x > this.plotRight()) continue;
       ctx.fillStyle = COLOR.lineStrong;
       ctx.fillRect(Math.round(x), this.bottom + 1, 1, 3);
       ctx.fillStyle = COLOR.unlikely;
@@ -656,9 +836,13 @@ export class TimelinePanel {
     ctx.font = uiFont(10.5, 500);
     ctx.fillStyle = COLOR.muted;
     const count = branches.length;
-    fillTabular(ctx, count === 0 ? 'path' : count === 1 ? '1 branch' : `${count} branches`, PAD_X + 9, y);
+    const label = count === 0 ? 'path' : count === 1 ? '1 branch' : `${count} branches`;
+    fillTabular(ctx, label, PAD_X + 9, y);
+    this.tree = emptyTree(y, label);
     if (n === 0) return;
 
+    ctx.save();
+    this.clipPlot(ctx);
     // The branches, dim: a curve out of the fork, then straight to the tip.
     const all = new Path2D();
     for (let k = 0; k < branches.length; k++) {
@@ -691,14 +875,23 @@ export class TimelinePanel {
     ctx.globalAlpha = 1;
     line(ctx, x0, xp, y);
 
+    // What the export draws again, collected as it is drawn here.
+    const forks: number[] = [];
+    const branchStops: { glyph: StopGlyph; x: number; y: number }[] = [];
+    const userMain: number[] = [];
+    const userBranch: { x: number; y: number }[] = [];
+    const cursors: { x: number; y: number; color: string; ring: boolean }[] = [];
+
     // Forks: a small knot on the main line where branches hang.
     ctx.fillStyle = COLOR.muted;
     let lastFork = -1;
     for (const b of branches) {
       if (b.fromIndex === lastFork) continue;
       lastFork = b.fromIndex;
+      const fx = this.xOf(b.fromIndex);
+      forks.push(fx);
       ctx.beginPath();
-      ctx.arc(this.xOf(b.fromIndex), y, 2, 0, Math.PI * 2);
+      ctx.arc(fx, y, 2, 0, Math.PI * 2);
       ctx.fill();
     }
 
@@ -707,18 +900,30 @@ export class TimelinePanel {
     const past = (branch: number, depth: number): number =>
       marks.some((m) => m.branch === branch && m.depth === depth) ? 10 : 5;
     const endPath = stopGlyph(s.stops.get(s.path[n - 1])?.reason);
-    if (endPath) stopMark(ctx, endPath, xe + past(-1, n - 1), y, COLOR.high);
+    let pathStop: { glyph: StopGlyph; x: number } | null = null;
+    if (endPath) {
+      pathStop = { glyph: endPath, x: xe + past(-1, n - 1) };
+      stopMark(ctx, endPath, pathStop.x, y, COLOR.high);
+    }
     for (let k = 0; k < branches.length; k++) {
       const g = stopGlyph(s.stops.get(branches[k].tip)?.reason);
       const l = this.mapLines[k];
-      if (g) stopMark(ctx, g, l.x1 + past(k, branches[k].tipDepth), l.y, COLOR.muted);
+      if (!g) continue;
+      const gx = l.x1 + past(k, branches[k].tipDepth);
+      branchStops.push({ glyph: g, x: gx, y: l.y });
+      stopMark(ctx, g, gx, l.y, COLOR.muted);
     }
 
     // The tokens the user chose: on the path, and at the start of a branch.
-    for (let i = 1; i < n; i++) if (s.origin[s.path[i]] === ORIGIN_USER) diamond(ctx, this.xOf(i), y);
+    for (let i = 1; i < n; i++) {
+      if (s.origin[s.path[i]] !== ORIGIN_USER) continue;
+      userMain.push(this.xOf(i));
+      diamond(ctx, this.xOf(i), y);
+    }
     for (let k = 0; k < branches.length; k++) {
       if (s.origin[branches[k].child] !== ORIGIN_USER) continue;
       const l = this.mapLines[k];
+      userBranch.push({ x: l.x0 + l.c, y: l.y });
       diamond(ctx, l.x0 + l.c, l.y);
     }
 
@@ -736,10 +941,14 @@ export class TimelinePanel {
         ctx.beginPath();
         ctx.arc(cx, cy, 5.5, 0, Math.PI * 2);
         ctx.stroke();
+        cursors.push({ x: cx, y: cy, color, ring: true });
       } else {
         dot(ctx, cx, cy, color);
+        cursors.push({ x: cx, y: cy, color, ring: false });
       }
     }
+    ctx.restore();
+    this.tree = { y, label, branches: this.mapLines, start: x0, prompt: xp, end: xe, forks, pathStop, branchStops, userMain, userBranch, cursors };
   }
 
   private drawOne(ctx: CanvasRenderingContext2D): void {
@@ -760,6 +969,8 @@ export class TimelinePanel {
     this.guides(ctx, [bottom], [top, (top + bottom) / 2]);
     if (n === 0) return;
 
+    ctx.save();
+    this.clipPlot(ctx);
     this.drawPrompt(ctx);
     // The trace breaks where there is no decision (the prompt).
     this.series(
@@ -769,7 +980,9 @@ export class TimelinePanel {
       bottom,
       top,
       COLOR.a,
+      'e',
     );
+    ctx.restore();
   }
 
   private drawTwo(ctx: CanvasRenderingContext2D): void {
@@ -796,6 +1009,8 @@ export class TimelinePanel {
     this.guides(ctx, [b.aBase, b.bBase], [b.aTop, b.bBottom, (b.aTop + b.aBase) / 2, (b.bBase + b.bBottom) / 2]);
     if (n === 0) return;
 
+    ctx.save();
+    this.clipPlot(ctx);
     this.drawPrompt(ctx);
 
     // Each trace breaks where its model did not evaluate the node.
@@ -806,6 +1021,7 @@ export class TimelinePanel {
       b.aBase,
       b.aTop,
       MODEL_COLOR[0],
+      'a',
     );
     this.series(
       ctx,
@@ -814,6 +1030,7 @@ export class TimelinePanel {
       b.bBase,
       b.bBottom,
       MODEL_COLOR[1],
+      'b',
     );
     this.series(
       ctx,
@@ -822,6 +1039,7 @@ export class TimelinePanel {
       b.dBase,
       b.dTop,
       COLOR.high,
+      'd',
     );
 
     // Disagreements: a slim magenta tick standing on the mark line, like a
@@ -829,7 +1047,8 @@ export class TimelinePanel {
     // run is drawn, so many of them read as a row instead of a smear.
     let lastX = -Infinity;
     const ticks = new Path2D();
-    for (let i = 1; i < n; i++) {
+    const [from, to] = this.visibleRange(n);
+    for (let i = Math.max(1, from); i <= to; i++) {
       if (!s.disagrees(i)) continue;
       const x = Math.round(this.xOf(i));
       if (x - lastX < DIS_GAP) continue;
@@ -841,6 +1060,13 @@ export class TimelinePanel {
     ctx.stroke(ticks);
     ctx.fillStyle = COLOR.dis;
     ctx.fill(ticks);
+    ctx.restore();
+  }
+
+  // The positions to draw for a window: those on screen and one more each
+  // side, so a line still enters and leaves it.
+  private visibleRange(n: number): [number, number] {
+    return [Math.max(0, Math.floor(this.lo) - 1), Math.min(n - 1, Math.ceil(this.lo + this.vis) + 1)];
   }
 
   // A trace with a soft area down (or up) to `base`, fading from the trace's
@@ -853,7 +1079,9 @@ export class TimelinePanel {
     base: number,
     far: number,
     color: string,
+    id: string,
   ): void {
+    this.seriesRecs.push({ id, color, value, y, base, far });
     const n = this.store.path.length;
     const line = new Path2D();
     const area = new Path2D();
@@ -869,7 +1097,8 @@ export class TimelinePanel {
       area.closePath();
       run = -1;
     };
-    for (let i = 0; i < n; i++) {
+    const [from, to] = this.visibleRange(n);
+    for (let i = from; i <= to; i++) {
       const v = value(i);
       if (v === undefined) {
         closeArea();
@@ -913,6 +1142,21 @@ export class TimelinePanel {
     ctx.fillStyle = color;
     for (let k = 0; k < dots.length; k += 2) ctx.fillRect(dots[k] - 1, dots[k + 1] - 1, 2, 2);
   }
+}
+
+// A trace as it was drawn, to draw it again for the export: the figure of
+// each position and how it maps to y.
+interface SeriesRec {
+  id: string;
+  color: string;
+  value: (i: number) => number | undefined;
+  y: (v: number) => number;
+  base: number;
+  far: number;
+}
+
+function emptyTree(y: number, label: string): SvgTree {
+  return { y, label, branches: [], start: NaN, prompt: NaN, end: NaN, forks: [], pathStop: null, branchStops: [], userMain: [], userBranch: [], cursors: [] };
 }
 
 // Positions across the horizontal axis, shared with the relief: the viewed

@@ -14,8 +14,10 @@ import type {
   Slots,
   StartCommand,
 } from './source/messages';
-import { loadSession, Player } from './source/recorded';
-import { NONE, type Config } from './source/frames';
+import { decodeSession, loadSession, Player } from './source/recorded';
+import { sessionJsonText } from './source/export-json';
+import { downloadBlob, downloadText, stamp } from './render/export';
+import { NONE, type Config, type Frame } from './source/frames';
 import { Store, type Slot } from './store/store';
 import { View } from './store/view';
 import { toast, ui, writePref, type DockTab, type InspectorTab } from './ui.svelte';
@@ -53,9 +55,19 @@ export const view = new View(store);
 
 let live: LiveSource | null = null;
 let player: Player | null = null;
+let replayFrames: Frame[] | null = null;
 let stream: StreamPanel | null = null;
 let reliefBox: HTMLElement | null = null;
-let relief: (ReliefPart & { dispose(): void; resetView(): void }) | null = null;
+let relief:
+  | (ReliefPart & {
+      dispose(): void;
+      resetView(): void;
+      zoomBy(factor: number): void;
+      setInfo(on: boolean): void;
+      save(kind: 'svg' | 'png'): Promise<void>;
+    })
+  | null = null;
+let timelinePanel: TimelinePanel | null = null;
 
 export interface Surfaces {
   stream: HTMLElement;
@@ -82,6 +94,7 @@ export function start(el: Surfaces): () => void {
   const gates = new GatesPanel(el.gates, store, view);
   const particles = new Particles(el.fx, MODEL_COLOR); // palette index = slot
   const timeline = new TimelinePanel(el.timeline, store, view);
+  timelinePanel = timeline;
   const metrics = new MetricsPanel(el.metrics, store, view);
   const lens = new LensPanel(el.lens, store, view);
   const compare = new ComparePanel(el.compare, store, view);
@@ -155,6 +168,7 @@ export function start(el: Surfaces): () => void {
     ui.mode = 'replay';
     loadSession(boot.session)
       .then((frames) => {
+        replayFrames = frames;
         player = new Player(frames, store);
         player.play();
         syncReplay();
@@ -186,6 +200,7 @@ export function start(el: Surfaces): () => void {
       if (stopped) return;
       try {
         relief = new Relief(el.reliefCanvas, el.reliefLabels, store, view, () => ui.reliefSource);
+        relief.setInfo(ui.reliefInfo);
         store.dirty.relief = true;
       } catch (e) {
         console.warn('Relief: WebGL2 is not available; the panel stays empty.', e);
@@ -199,6 +214,7 @@ export function start(el: Surfaces): () => void {
     stopLoop();
     relief?.dispose();
     relief = null;
+    timelinePanel = null;
     reliefBox = null;
     birth.cancel();
     run.cancel();
@@ -598,6 +614,53 @@ export function resetReliefView(): void {
   relief?.resetView();
 }
 
+// Each button press moves the view by this factor.
+const ZOOM_STEP = 1.5;
+
+// Relief: the camera closer (dir 1) or farther (-1).
+export function zoomRelief(dir: 1 | -1): void {
+  relief?.zoomBy(dir > 0 ? ZOOM_STEP : 1 / ZOOM_STEP);
+}
+
+// Ticks, ruler, info card and legend over the Relief, on or off.
+export function toggleReliefInfo(): void {
+  ui.reliefInfo = !ui.reliefInfo;
+  writePref('reliefInfo', ui.reliefInfo ? null : '0');
+  relief?.setInfo(ui.reliefInfo);
+}
+
+function exportFailed(what: string, e: unknown): void {
+  toast('error', `${what} export failed: ${e instanceof Error ? e.message : String(e)}`);
+}
+
+// Saves what the Relief shows: vector (SVG) or picture (PNG).
+export async function exportRelief(kind: 'svg' | 'png'): Promise<void> {
+  try {
+    if (!relief) throw new Error('the 3D view is not available');
+    await relief.save(kind);
+  } catch (e) {
+    exportFailed('Relief', e);
+  }
+}
+
+// Timeline: the position axis closer (dir 1), farther (-1), or all of it (0).
+export function zoomTimeline(dir: 1 | -1 | 0): void {
+  if (dir === 0) timelinePanel?.zoomFit();
+  else timelinePanel?.zoomBy(dir > 0 ? ZOOM_STEP : 1 / ZOOM_STEP);
+}
+
+// Saves the Timeline as it is on screen (the zoomed window).
+export async function exportTimeline(kind: 'svg' | 'png'): Promise<void> {
+  try {
+    if (!timelinePanel) throw new Error('the timeline is not available');
+    const name = `inside-llm-timeline-${stamp()}`;
+    if (kind === 'svg') downloadText(timelinePanel.exportSvg(), `${name}.svg`);
+    else downloadBlob(await timelinePanel.exportPng(), `${name}.png`);
+  } catch (e) {
+    exportFailed('Timeline', e);
+  }
+}
+
 // Alternatives or Layers; Layers only with the logit lens.
 export function setReliefSource(source: ReliefSource): void {
   ui.reliefSource = source === 'layers' && ui.lens ? 'layers' : 'alternatives';
@@ -754,4 +817,27 @@ function onKey(e: KeyboardEvent): void {
       if (ui.modelsOpen || ui.connected || !ui.everConnected) toggleModels();
       break;
   }
+}
+
+// Downloads the whole session as JSON: every frame decoded plus what the
+// panels derive from them (see source/export-json.ts). Live, the engine's
+// log is fetched; in a replay, the frames already loaded are used.
+export async function exportJson(): Promise<void> {
+  try {
+    const frames = replayFrames ?? (await fetchLiveSession());
+    const blob = new Blob([sessionJsonText(frames)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'session.json';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
+  } catch (e) {
+    toast('error', `JSON export failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+async function fetchLiveSession(): Promise<Frame[]> {
+  const res = await fetch('api/session.ils', { cache: 'no-store' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return decodeSession(new Uint8Array(await res.arrayBuffer()));
 }

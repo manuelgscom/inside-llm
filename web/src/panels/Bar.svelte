@@ -9,6 +9,7 @@
   // Under it, live only, a strip while the connection to the engine is lost;
   // the engine controls are disabled and dimmed meanwhile.
   import {
+    exportJson,
     follow,
     noModel,
     openModels,
@@ -316,6 +317,11 @@
     {:else if live}
       <a class="button ghost tool" href="api/session.ils" download="session.ils" data-tip="Download this session" data-tip-end
         ><Icon name="download" size={16} />Session</a
+      >
+    {/if}
+    {#if !live || !lost}
+      <button class="ghost tool" onclick={exportJson} data-tip="Download this session as JSON, with the metrics and the 3D relief data" data-tip-end
+        ><Icon name="download" size={16} />JSON</button
       >
     {/if}
     <button

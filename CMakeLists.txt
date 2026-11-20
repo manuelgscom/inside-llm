@@ -6,11 +6,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Build options:
-#   ILS_BACKEND  GPU backend of llama.cpp: CUDA (default) or VULKAN.
+#   ILS_BACKEND  GPU backend of llama.cpp: CUDA (default), VULKAN or METAL (macOS).
 #   ILS_DIST     portable binary for distribution: no -march=native (ggml's
 #                x86-64 baseline instead: AVX2, FMA, F16C, BMI2) and no NCCL.
-set(ILS_BACKEND CUDA CACHE STRING "GPU backend of llama.cpp: CUDA or VULKAN")
-set_property(CACHE ILS_BACKEND PROPERTY STRINGS CUDA VULKAN)
+set(ILS_BACKEND CUDA CACHE STRING "GPU backend of llama.cpp: CUDA, VULKAN or METAL")
+set_property(CACHE ILS_BACKEND PROPERTY STRINGS CUDA VULKAN METAL)
 option(ILS_DIST "Portable build for distribution (no -march=native, no NCCL)" OFF)
 
 # llama.cpp as a static library. Tools, examples, server and tests are
@@ -18,11 +18,23 @@ option(ILS_DIST "Portable build for distribution (no -march=native, no NCCL)" OF
 if(ILS_BACKEND STREQUAL "CUDA")
     set(GGML_CUDA   ON  CACHE BOOL "" FORCE)
     set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
+    set(GGML_METAL  OFF CACHE BOOL "" FORCE)
 elseif(ILS_BACKEND STREQUAL "VULKAN")
     set(GGML_CUDA   OFF CACHE BOOL "" FORCE)
     set(GGML_VULKAN ON  CACHE BOOL "" FORCE)
+    set(GGML_METAL  OFF CACHE BOOL "" FORCE)
+elseif(ILS_BACKEND STREQUAL "METAL")
+    if(NOT APPLE)
+        message(FATAL_ERROR "ILS_BACKEND=METAL needs macOS")
+    endif()
+    set(GGML_CUDA   OFF CACHE BOOL "" FORCE)
+    set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
+    set(GGML_METAL  ON  CACHE BOOL "" FORCE)
+    # The Metal shaders are embedded as source and compiled by the driver at
+    # start-up, so the Metal toolchain of Xcode is not needed.
+    set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)
 else()
-    message(FATAL_ERROR "ILS_BACKEND must be CUDA or VULKAN, not '${ILS_BACKEND}'")
+    message(FATAL_ERROR "ILS_BACKEND must be CUDA, VULKAN or METAL, not '${ILS_BACKEND}'")
 endif()
 if(ILS_DIST)
     set(GGML_NATIVE    OFF CACHE BOOL "" FORCE)
