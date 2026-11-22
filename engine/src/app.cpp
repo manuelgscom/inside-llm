@@ -55,18 +55,24 @@ void open_browser(const std::string& url) {
     if (rc <= 32) std::fprintf(stderr, "note: could not open a browser; open the URL by hand\n");
 }
 #else
-// Opens the URL with xdg-open, without a shell. Never fails the app.
+// Opens the URL with the desktop's opener (open on macOS, xdg-open
+// elsewhere), without a shell. Never fails the app.
 void open_browser(const std::string& url) {
+#ifdef __APPLE__
+    const char* opener = "open";
+#else
+    const char* opener = "xdg-open";
+#endif
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
     posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", O_WRONLY, 0);
     posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0);
     pid_t pid = 0;
-    char* argv[] = {const_cast<char*>("xdg-open"), const_cast<char*>(url.c_str()), nullptr};
-    const int rc = posix_spawnp(&pid, "xdg-open", &actions, nullptr, argv, environ);
+    char* argv[] = {const_cast<char*>(opener), const_cast<char*>(url.c_str()), nullptr};
+    const int rc = posix_spawnp(&pid, opener, &actions, nullptr, argv, environ);
     posix_spawn_file_actions_destroy(&actions);
     if (rc != 0) {
-        std::fprintf(stderr, "note: could not open a browser (xdg-open not found); open the URL by hand\n");
+        std::fprintf(stderr, "note: could not open a browser (%s not found); open the URL by hand\n", opener);
         return;
     }
     std::thread([pid] { waitpid(pid, nullptr, 0); }).detach();  // reap it

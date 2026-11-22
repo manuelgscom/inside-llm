@@ -65,8 +65,10 @@ if(MSVC AND VCPKG_TARGET_TRIPLET MATCHES "-static$")
 endif()
 
 find_package(Threads REQUIRED)
-if(NOT WIN32)
-    set(ZLIB_USE_STATIC_LIBS ON)  # libz.a: one dependency less at run time
+# libz.a: one dependency less at run time. Not on macOS: its SDK ships zlib
+# only as a system dylib (libz.tbd), which every Mac has.
+if(NOT WIN32 AND NOT APPLE)
+    set(ZLIB_USE_STATIC_LIBS ON)
 endif()
 find_package(ZLIB REQUIRED)
 
