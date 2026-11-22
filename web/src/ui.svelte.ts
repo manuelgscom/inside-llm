@@ -20,7 +20,7 @@ export type InspectorTab = 'candidates' | 'compare';
 
 // Small per-browser preferences (dock tab and height, first-visit tips seen).
 // Storage can be missing or refuse access: then the defaults hold.
-type Pref = 'dockTab' | 'dockH' | 'hints';
+type Pref = 'dockTab' | 'dockH' | 'hints' | 'reliefInfo';
 
 export function readPref(key: Pref): string | null {
   try {
@@ -77,6 +77,7 @@ class Ui {
   lens = $state(false); // the session has the logit lens (HELLO lens.enabled)
   generated = $state(false); // the viewed path has generated tokens (sampled)
   reliefSource = $state<ReliefSource>('alternatives'); // Layers only with the lens
+  reliefInfo = $state(readPref('reliefInfo') !== '0'); // ticks, ruler, info card and legend over the Relief
 
   // Layout.
   helpOpen = $state(false); // the help modal

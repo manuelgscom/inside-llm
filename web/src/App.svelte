@@ -7,6 +7,8 @@
   // are painted by the loop, not by Svelte.
   import { onMount } from 'svelte';
   import {
+    exportRelief,
+    exportTimeline,
     noModel,
     resetReliefView,
     setDockTab,
@@ -14,6 +16,9 @@
     setReliefSource,
     start,
     toggleReliefFullscreen,
+    toggleReliefInfo,
+    zoomRelief,
+    zoomTimeline,
   } from './app';
   import Bar from './panels/Bar.svelte';
   import Composer from './panels/Composer.svelte';
@@ -135,6 +140,39 @@
   {/if}
 {/snippet}
 
+{#snippet viewTools(kind: 'relief' | 'timeline')}
+  <span class="tools-group" role="group" aria-label="Zoom">
+    <button
+      class="ghost icon-only"
+      onclick={() => (kind === 'relief' ? zoomRelief(-1) : zoomTimeline(-1))}
+      aria-label="Zoom out"
+      title={kind === 'relief' ? 'Zoom out (wheel)' : 'Zoom out (wheel)'}><Icon name="zoomOut" /></button
+    >
+    <button
+      class="ghost icon-only"
+      onclick={() => (kind === 'relief' ? zoomRelief(1) : zoomTimeline(1))}
+      aria-label="Zoom in"
+      title={kind === 'relief' ? 'Zoom in (wheel); right-drag pans' : 'Zoom in (wheel); shift+wheel pans'}
+      ><Icon name="zoomIn" /></button
+    >
+    {#if kind === 'timeline'}
+      <button class="ghost" onclick={() => zoomTimeline(0)} title="Show the whole path">Fit</button>
+    {/if}
+  </span>
+  <span class="tools-group" role="group" aria-label="Export">
+    <button
+      class="ghost"
+      onclick={() => (kind === 'relief' ? exportRelief('svg') : exportTimeline('svg'))}
+      title="Save as SVG (vector, as shown now)"><Icon name="download" />SVG</button
+    >
+    <button
+      class="ghost"
+      onclick={() => (kind === 'relief' ? exportRelief('png') : exportTimeline('png'))}
+      title="Save as PNG (picture, at twice the size)"><Icon name="download" />PNG</button
+    >
+  </span>
+{/snippet}
+
 <div class="app" style:--bar-h="{barH}px" style:--dock-h={dockStyle}>
   <div class="ambient" aria-hidden="true">
     <i class="halo a" style={halo(ui.ambient[0], 1)}></i>
@@ -246,19 +284,31 @@
           aria-selected={onRelief}
           onclick={() => setDockTab('relief')}
           data-tip-up
-          data-tip="The viewed path as a 3D surface. Drag to orbit, wheel to zoom."
+          data-tip="The viewed path as a 3D surface. Drag to orbit, wheel to zoom, right-drag to pan. Hover to inspect, click to pin."
           ><Icon name="cube" />Relief 3D</button
         >
       </div>
       {#if onRelief}
         <div class="panel-tools">
           {@render sourceToggle()}
+          <button
+            class="ghost"
+            class:on={ui.reliefInfo}
+            aria-pressed={ui.reliefInfo}
+            onclick={toggleReliefInfo}
+            title="Ticks, probability ruler, info card and legend"><Icon name="info" />Info</button
+          >
+          {@render viewTools('relief')}
           <button class="ghost" onclick={resetReliefView} title="Camera back to the start"
             ><Icon name="reset" />Reset view</button
           >
           <button class="ghost" onclick={toggleReliefFullscreen} title="Full screen (F)"
             ><Icon name="expand" />Full screen</button
           >
+        </div>
+      {:else if ui.dockTab === 'timeline'}
+        <div class="panel-tools">
+          {@render viewTools('timeline')}
         </div>
       {/if}
     </div>
@@ -280,6 +330,8 @@
           <span class="relief-name"><Icon name="cube" />Relief 3D</span>
           {@render sourceToggle()}
           <span class="grow"></span>
+          <button class:on={ui.reliefInfo} aria-pressed={ui.reliefInfo} onclick={toggleReliefInfo}><Icon name="info" />Info</button>
+          {@render viewTools('relief')}
           <button onclick={resetReliefView}><Icon name="reset" />Reset view</button>
           <button onclick={toggleReliefFullscreen} title="Exit full screen (Esc)"
             ><Icon name="shrink" />Exit full screen</button

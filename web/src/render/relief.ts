@@ -81,6 +81,7 @@ import {
   Mesh,
   PerspectiveCamera,
   PlaneGeometry,
+  Raycaster,
   Scene,
   ShaderMaterial,
   SRGBColorSpace,
@@ -96,21 +97,56 @@ import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
-import type { Store } from '../store/store';
+import type { Slot, Store } from '../store/store';
 import { showWhitespace, tokenLabel } from '../store/text';
 import type { View } from '../store/view';
-import { ICONS } from './icons';
+import { modelFigures, pairFigures, pctShort } from './compare';
+import { downloadBlob, downloadText, stamp, svgDocument, svgToPngBlob } from './export';
+import { decisionLayer, finalTop } from './lens-data';
+import {
+  CHIP_GAP,
+  estimateWidth,
+  notesSvg,
+  rulerTicks,
+  spreadChips,
+  strideRows,
+  tickPositions,
+  cardSize,
+  type CardNote,
+  type Measure,
+  type Notes,
+  type Part,
+} from './relief-notes';
+import {
+  AMBIENT,
+  CLIFF_DIM,
+  DIS_GAIN,
+  DIS_LOW,
+  DIS_MIX,
+  GROUND,
+  LIGHT_DIR,
+  PLANE_RISE,
+  RAMP,
+  RIM,
+  sceneSvg,
+  STEEP,
+  TOP,
+  WHITE,
+  WHITE_FROM,
+  WHITE_MIX,
+} from './relief-svg';
 import {
   fitDistance,
   growDuration,
   growFactor,
+  pOf,
   RELIEF_W,
   ReliefData,
   reliefShape,
   type ReliefSource,
 } from './relief-data';
 import { Pace } from './pace';
-import { COLOR, FONT, FONT_UI, MODEL_COLOR, rgba } from './theme';
+import { COLOR, FONT, FONT_UI, MODEL_COLOR } from './theme';
 import { axisSpan } from './timeline';
 
 // World size of the relief: x across the positions, z across the rows, y up.
@@ -138,29 +174,15 @@ const ORBIT_EASE = 0.8; // how much slower at the ends
 const AZIMUTH_LIMIT = Math.PI / 3; // ±60° around the front
 const POLAR_MIN = 0.22; // almost top-down
 const POLAR_MAX = Math.PI / 2 - 0.05; // almost level, never under the floor
-const ZOOM_IN = 0.4; // distance limits, times the fitted distance
-const ZOOM_OUT = 1.8;
+const ZOOM_IN = 0.07; // distance limits, times the fitted distance: close enough to read one column
+const ZOOM_OUT = 2.6;
 const RESET_MS = 520;
 const LABEL_CHARS = 14;
-const LABEL_GAP = 21; // CSS px between the centres of two layer labels
-const LEADER = 8; // CSS px of the line from a layer label towards the plane
-const PLANE_RISE = 1.08; // the light plane stands this much above height 1
 
-// The surface's colours, in linear light, from the height h (0..1):
-// hue × (GROUND + (TOP - GROUND)·h^RAMP), so the low ground stays near black
-// but its shape still reads, and the slopes carry the hue without the sure
-// crests (most of them) becoming a bright wall.
-const GROUND = 0.03;
-const TOP = 0.55;
-const RAMP = 2.2;
-// Shading: an ambient floor plus a light from up, front and left.
-const AMBIENT = 0.5;
-const LIGHT = new Vector3(-0.35, 0.85, 0.45).normalize();
-// Doubt: from WHITE_FROM of the column's crest up, mixed towards WHITE (over
-// 1, for the bloom) by up to WHITE_MIX times the column's doubt.
-const WHITE_FROM = 0.78;
-const WHITE = 1.35;
-const WHITE_MIX = 0.8;
+// The surface's colours (heights to hue, shading, doubt, cliffs, divergence)
+// are the constants of relief-svg.ts, shared with the vector export; see
+// there for what each one does.
+const LIGHT = new Vector3(...LIGHT_DIR);
 // Isolines: ISO_STEPS per unit of height, added as ISO_GAIN of the hue (under
 // the bloom). Lines that would be wider than ISO_FADE of their spacing per
 // pixel (a cliff) fade out; none on the flat ground under ISO_MIN.
@@ -168,30 +190,14 @@ const ISO_STEPS = 10;
 const ISO_GAIN = 0.22;
 const ISO_FADE = [0.12, 0.3] as const;
 const ISO_MIN = 0.02;
-// Cliffs: where the surface stands steep (its normal's y under STEEP[1]) it
-// faces the camera as a wall; there it is dimmed to CLIFF_DIM except near
-// the column's crest (from RIM of it), so the sure crests read as a thin
-// skyline and not as a lit wall.
-const STEEP = [0.2, 0.6] as const;
-const CLIFF_DIM = 0.12;
-const RIM = 0.9;
-// Divergence d: the colour moves towards magenta by DIS_MIX·d, to DIS_LOW
-// of it in the trench and DIS_LOW + DIS_GAIN·d at the crest, so that only a
-// full divergence (different picks) goes over the bloom's threshold.
+// The divergence's magenta, for the shader.
 const DIS = new Color(COLOR.dis);
-const DIS_LOW = 0.12;
-const DIS_GAIN = 2.9;
-const DIS_MIX = 0.85;
 // The other model's surface: its isolines, over a fill this opaque.
 const BACK_FILL = 0.06;
 const BACK_LINE = 0.7;
 // Bloom: strength, radius, luminance threshold. Over the threshold: white
 // and magenta crests, the cut of the selected column and the plane's edges.
 const BLOOM = [0.48, 0.35, 0.9] as const;
-
-// The axis labels, in the floor's corners.
-type AxisLabel = 'position' | 'back' | 'front';
-const AXIS_LABELS: readonly AxisLabel[] = ['position', 'back', 'front'];
 
 // ------------------------------------------------------------- shaders
 
@@ -449,22 +455,28 @@ export class Relief {
   private growDur = 0;
   private readonly pace = new Pace();
 
-  // Layers: one chip per layer at the selected position.
-  private readonly labels: HTMLElement[] = [];
-  private readonly labelParts: HTMLElement[][] = []; // [layer, token, p] per chip
-  private labelRows = 0;
-  private readonly labelX: number[] = [];
-  private readonly labelY: number[] = [];
-  private readonly labelOrder: number[] = [];
+  // The annotations over the canvas (see relief-notes.ts): one SVG, rewritten
+  // whenever the picture is.
+  private readonly notesEl: SVGSVGElement;
+  private info = true; // ticks, ruler, info card, legend and hover card
+  private disagreements = 0; // positions of the viewed path where the models picked differently
+  private readonly home = new Vector3(); // the camera's target at the default view
+  private readonly fromTarget = new Vector3();
   private readonly v = new Vector3();
-  // Axis labels: what x and z mean, at the floor's corners.
-  private readonly axis: HTMLElement[] = [];
-  private readonly axisText: HTMLElement[] = [];
-  private readonly axisW: number[] = []; // width of each axis label, read when its text changes
+  private readonly v2 = new Vector3();
+  private readonly ray = new Raycaster();
+  private readonly ndc = new Vector2();
+  private hover: { col: number; row: number; x: number; y: number } | null = null;
+  private down: { x: number; y: number } | null = null; // pointer at the press, to tell a click from a drag
+  private measureCtx: CanvasRenderingContext2D | null = null;
+  private lastNotes = '';
+  private pickStale = true; // the surface moved: its bounds must be computed again
+  private pending: PointerEvent | null = null; // the last pointer move not yet handled
+  private pickFrame = 0;
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
-    private readonly labelBox: HTMLElement,
+    labelBox: HTMLElement,
     private readonly store: Store,
     private readonly view: View,
     private readonly source: () => ReliefSource,
@@ -584,34 +596,14 @@ export class Relief {
     this.scene.add(this.plane);
     this.statics.push(floorGeo, this.floorMat, outGeo, outMat, planeGeo, edgeGeo, this.edgeMat);
 
-    // Axis labels: small caps in the UI face; the position one carries an
-    // arrow drawn as an icon. Styled here: the box is shared with the Layers
-    // chips, and the panel's CSS only knows plain spans.
-    for (let k = 0; k < AXIS_LABELS.length; k++) {
-      const el = document.createElement('div');
-      const st = el.style;
-      st.position = 'absolute';
-      st.left = '0';
-      st.top = '0';
-      st.display = 'flex';
-      st.alignItems = 'center';
-      st.gap = '6px';
-      st.color = COLOR.muted;
-      st.fontFamily = FONT_UI;
-      st.fontSize = '11px';
-      st.fontWeight = '500';
-      st.whiteSpace = 'nowrap';
-      st.lineHeight = '1';
-      st.opacity = '0.8';
-      st.visibility = 'hidden';
-      const text = document.createElement('b');
-      text.style.fontWeight = 'inherit';
-      el.append(text);
-      if (AXIS_LABELS[k] === 'position') el.append(arrowIcon());
-      labelBox.append(el);
-      this.axis.push(el);
-      this.axisText.push(text);
-    }
+    // The annotations: ticks, row labels, chips, cards.
+    const ns = 'http://www.w3.org/2000/svg';
+    this.notesEl = document.createElementNS(ns, 'svg');
+    this.notesEl.setAttribute('width', '100%');
+    this.notesEl.setAttribute('height', '100%');
+    this.notesEl.setAttribute('aria-hidden', 'true');
+    this.notesEl.style.cssText = 'position:absolute;inset:0;overflow:hidden;pointer-events:none';
+    labelBox.append(this.notesEl);
 
     // Camera: slow auto-orbit, turned and zoomed with the mouse, within
     // limits (see the header).
@@ -619,7 +611,9 @@ export class Relief {
     this.controls = new OrbitControls(this.camera, canvas);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.08;
-    this.controls.enablePan = false;
+    this.controls.enablePan = true; // right button, or two fingers: to read one column up close
+    this.controls.zoomToCursor = true; // the wheel zooms where the pointer is
+    this.controls.zoomSpeed = 1.2;
     this.controls.minAzimuthAngle = -AZIMUTH_LIMIT;
     this.controls.maxAzimuthAngle = AZIMUTH_LIMIT;
     this.controls.minPolarAngle = POLAR_MIN;
@@ -629,6 +623,10 @@ export class Relief {
     this.controls.addEventListener('start', this.onStart);
     this.reduced.addEventListener('change', this.onReduced);
 
+    canvas.addEventListener('pointermove', this.onPointerMove);
+    canvas.addEventListener('pointerleave', this.onPointerLeave);
+    canvas.addEventListener('pointerdown', this.onPointerDown);
+    canvas.addEventListener('pointerup', this.onPointerUp);
     canvas.addEventListener('webglcontextlost', this.onLost);
     canvas.addEventListener('webglcontextrestored', this.onRestored);
 
@@ -685,8 +683,7 @@ export class Relief {
     if (!this.needs) return;
     this.needs = false;
     this.composer.render();
-    if (this.labelRows > 0) this.placeLabels();
-    this.placeAxis();
+    this.drawNotes();
   }
 
   // Back to the fitted default view, then the automatic orbit again: a
@@ -698,10 +695,12 @@ export class Relief {
       return;
     }
     const c = this.controls;
+    this.fromTarget.copy(c.target);
     this.from.r = this.camera.position.distanceTo(c.target);
     this.from.phi = c.getPolarAngle();
     this.from.theta = c.getAzimuthalAngle();
     if (this.reduced.matches) {
+      c.target.copy(this.home);
       this.lookFrom(this.fitDist, Math.PI / 2 - this.elevation, 0);
       this.endReset();
       return;
@@ -724,17 +723,26 @@ export class Relief {
     for (const s of this.statics) s.dispose();
     this.composer.dispose();
     this.renderer.dispose();
-    for (const l of this.labels) l.remove();
-    this.labels.length = 0;
-    this.labelParts.length = 0;
-    for (const l of this.axis) l.remove();
-    this.axis.length = 0;
-    this.axisText.length = 0;
+    if (this.pickFrame !== 0) cancelAnimationFrame(this.pickFrame);
+    this.canvas.removeEventListener('pointermove', this.onPointerMove);
+    this.canvas.removeEventListener('pointerleave', this.onPointerLeave);
+    this.canvas.removeEventListener('pointerdown', this.onPointerDown);
+    this.canvas.removeEventListener('pointerup', this.onPointerUp);
+    this.notesEl.remove();
   }
 
   // ----------------------------------------------------------- internal
 
+  // The target may be panned, but never out of the box: the view cannot get lost.
   private readonly onChange = (): void => {
+    const t = this.controls.target;
+    const x = Math.min(Math.max(t.x, -W / 2), W / 2);
+    const y = Math.min(Math.max(t.y, 0), this.hh * PLANE_RISE);
+    const z = Math.min(Math.max(t.z, -this.d / 2), this.d / 2);
+    if (x !== t.x || y !== t.y || z !== t.z) {
+      this.camera.position.add(this.v.set(x - t.x, y - t.y, z - t.z));
+      t.set(x, y, z);
+    }
     this.needs = true;
   };
 
@@ -825,12 +833,14 @@ export class Relief {
     }
     const prev = this.fitDist;
     const keep = this.fitted && this.user;
+    const pan = keep ? this.v.copy(c.target).sub(this.home) : this.v.set(0, 0, 0);
     const zoom = keep ? this.camera.position.distanceTo(c.target) / prev : 1;
     const polar = keep ? c.getPolarAngle() : phi;
     const az = this.fitted ? c.getAzimuthalAngle() : 0;
     const azimuth = keep ? az : Math.min(Math.max(az, -this.sway), this.sway);
     this.fitDist = dist;
-    c.target.set(0, hy, 0);
+    this.home.set(0, hy, 0);
+    c.target.copy(this.home).add(pan);
     c.minDistance = dist * ZOOM_IN;
     c.maxDistance = dist * ZOOM_OUT;
     this.camera.near = Math.max(0.1, dist * 0.01);
@@ -861,6 +871,7 @@ export class Relief {
     const e = k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2; // ease in-out cubic
     const fr = this.from;
     const phi = Math.PI / 2 - this.elevation;
+    this.controls.target.lerpVectors(this.fromTarget, this.home, e);
     this.lookFrom(fr.r + (this.fitDist - fr.r) * e, fr.phi + (phi - fr.phi) * e, fr.theta * (1 - e));
     if (k >= 1) this.endReset();
   }
@@ -899,7 +910,6 @@ export class Relief {
       this.sel = sel;
       this.pinned = pinned;
       this.placePlane();
-      this.writeLabels();
       this.needs = true;
     }
   }
@@ -910,6 +920,8 @@ export class Relief {
     const d = this.data;
     d.update(s, source);
     this.span = axisSpan(s.path.length, s.branches());
+    this.disagreements = 0;
+    if (s.twoModels) for (let i = 1; i < s.path.length; i++) if (s.disagrees(i)) this.disagreements++;
     this.backTone = s.other;
     this.backFirst = d.source === 'alternatives';
     if (d.capacity !== this.cap || d.rows !== this.rows) {
@@ -1008,6 +1020,7 @@ export class Relief {
     this.lines.geometry.dispose();
     this.profile.geometry.dispose();
     this.front.geometry = front;
+    this.pickStale = true;
     this.back.geometry = back;
     this.lines.geometry = lines;
     this.profile.geometry = profile;
@@ -1043,6 +1056,7 @@ export class Relief {
       a.addUpdateRange(from * rows * a.itemSize, (to - from) * rows * a.itemSize);
       a.needsUpdate = true;
     }
+    this.pickStale = true;
     if (this.sel >= from && this.sel < to) this.writeProfile();
     this.needs = true;
   }
@@ -1107,164 +1121,474 @@ export class Relief {
     this.profile.geometry.setDrawRange(0, rows);
   }
 
-  // The axis labels at the floor's corners: "position" and an arrow under
-  // the front edge, and what the rows mean at the back and front of the
-  // left edge.
-  private placeAxis(): void {
-    const show = this.front.visible;
-    for (let k = 0; k < this.axis.length; k++) {
-      const el = this.axis[k];
-      if (!show) {
-        el.style.visibility = 'hidden';
-        continue;
-      }
-      const which = AXIS_LABELS[k];
-      const layers = this.data.source === 'layers';
-      // Back of the box is -z. Alternatives: the most likely row at the
-      // back; Layers: the first layer in front, the last at the back.
-      const text = which === 'position' ? 'position' : which === 'back' ? (layers ? 'last layer' : 'most likely') : layers ? 'first layer' : 'less likely';
-      const t = this.axisText[k];
-      if (t.textContent !== text) {
-        t.textContent = text;
-        this.axisW[k] = el.offsetWidth;
-      }
-      if (which === 'position') this.v.set(-W / 2 + W * 0.04, 0, this.d / 2);
-      else this.v.set(-W / 2, 0, which === 'back' ? -this.d / 2 : this.d / 2);
-      this.v.project(this.camera);
-      if (this.v.z > 1 || Math.abs(this.v.x) > 1.1 || Math.abs(this.v.y) > 1.1) {
-        el.style.visibility = 'hidden';
-        continue;
-      }
-      el.style.visibility = '';
-      const px = Math.round(((this.v.x + 1) / 2) * this.w);
-      const py = Math.round(((1 - this.v.y) / 2) * this.h);
-      // The row labels go left of the corner; on a narrow panel the box
-      // reaches the edge, so they are kept inside it, over the floor. The
-      // position label stays inside the bottom edge.
-      el.style.transform =
-        which === 'position'
-          ? `translate(${px}px, ${Math.min(py + 8, this.h - 16)}px)`
-          : `translate(${Math.max(6, px - 10 - (this.axisW[k] ?? 0))}px, ${py}px) translateY(-50%)`;
-    }
-  }
+  // ----------------------------------------------------- zoom and export
 
-  // Layers: a chip "L<layer> <token> <top_p>" per layer at the selected
-  // position. Texts change here; positions follow the camera in placeLabels().
-  private writeLabels(): void {
-    const s = this.store;
-    const d = this.data;
-    const sel = this.sel;
-    const lens = d.source === 'layers' && sel >= 0 && sel < d.cols ? (s.decision(sel)?.lens ?? null) : null;
-    const layers = s.hello?.lens.layers ?? [];
-    const n = lens ? Math.min(lens.topId.length, d.rows) : 0;
-    while (this.labels.length < n) this.addChip();
-    const tone = sel >= 0 && sel < d.cols ? MODEL_COLOR[d.tone[sel]] : COLOR.a;
-    for (let r = 0; r < this.labels.length; r++) {
-      const el = this.labels[r];
-      if (!lens || r >= n) {
-        el.style.display = 'none';
-        continue;
-      }
-      const v = s.vocab.get(lens.topId[r]);
-      const text = v ? showWhitespace(tokenLabel(v.bytes)) : `#${lens.topId[r]}`;
-      const short = text.length > LABEL_CHARS ? text.slice(0, LABEL_CHARS - 1) + '…' : text;
-      const [layer, token, p] = this.labelParts[r];
-      layer.textContent = `L${layers[r] ?? r}`;
-      token.textContent = short;
-      p.textContent = `${Math.round(lens.topP[r] * 100)}%`;
-      p.style.color = tone;
-      el.style.display = 'flex';
-    }
-    this.labelRows = n;
+  // Moves the camera towards (factor > 1) or away from the point it looks
+  // at, within the zoom limits.
+  zoomBy(factor: number): void {
+    const c = this.controls;
+    const off = this.camera.position.clone().sub(c.target);
+    const r = Math.min(Math.max(off.length() / factor, c.minDistance), c.maxDistance);
+    this.camera.position.copy(c.target).add(off.setLength(r));
+    this.user = true;
+    c.update();
     this.needs = true;
   }
 
-  // A rounded chip, almost opaque so the surface does not show through its
-  // text: the layer in the UI face, the token in the monospaced one, the
-  // probability in the model's colour. A short line on its left points to
-  // the plane, so the chip reads as a label of that point.
-  private addChip(): void {
-    const el = document.createElement('div');
-    const st = el.style;
-    st.position = 'absolute';
-    st.left = '0';
-    st.top = '0';
-    st.display = 'none';
-    st.alignItems = 'center';
-    st.gap = '6px';
-    st.height = '18px';
-    st.padding = '0 8px 0 7px';
-    st.boxSizing = 'border-box';
-    st.borderRadius = '8px';
-    st.border = `1px solid ${rgba(COLOR.lineStrong, 0.9)}`;
-    st.background = rgba(COLOR.surface, 0.94);
-    st.boxShadow = `0 2px 10px ${rgba(COLOR.bg, 0.5)}`;
-    st.whiteSpace = 'pre';
-    st.lineHeight = '16px';
-    const leader = document.createElement('span');
-    const ls = leader.style;
-    ls.position = 'absolute';
-    ls.left = `${-LEADER - 1}px`; // outside the 1px border
-    ls.top = '50%';
-    ls.width = `${LEADER}px`;
-    ls.height = '1px';
-    ls.background = rgba(COLOR.muted, 0.55);
-    el.append(leader);
-    const part = (font: string, size: string, weight: string, color: string): HTMLElement => {
-      const b = document.createElement('b');
-      const bs = b.style;
-      bs.fontFamily = font;
-      bs.fontSize = size;
-      bs.fontWeight = weight;
-      bs.color = color;
-      bs.fontVariantNumeric = 'tabular-nums';
-      el.append(b);
-      return b;
-    };
-    const parts = [part(FONT_UI, '10.5px', '600', COLOR.muted), part(FONT, '12px', '400', COLOR.high), part(FONT_UI, '10.5px', '600', COLOR.a)];
-    this.labelBox.append(el);
-    this.labels.push(el);
-    this.labelParts.push(parts);
+  // Ticks, ruler, info card, legend and hover card on or off.
+  setInfo(on: boolean): void {
+    this.info = on;
+    this.needs = true;
   }
 
-  // Each chip next to the plane, at its layer's height. Where the layers lie
-  // close on the screen the chips are spread, top to bottom, so that none
-  // covers another; when they cannot all fit in the panel's height, only
-  // every k-th layer keeps its chip (the last layer always does).
-  private placeLabels(): void {
+  // The relief as an SVG document of the panel's size: the surface as shaded
+  // polygons, sorted back to front, from the camera as it is now, with the
+  // same annotations as on screen. Throws without anything to draw.
+  exportSvg(): string {
+    this.requireDrawn();
+    this.endGrowth(); // a column still growing would be saved part-way
+    this.camera.updateMatrixWorld();
+    const d = this.data;
+    const scene = sceneSvg({
+      cols: d.cols,
+      rows: d.rows,
+      front: d.front,
+      back: this.back.visible ? d.back : null,
+      doubt: d.doubt,
+      div: d.div,
+      tone: d.tone,
+      backSlot: this.backTone,
+      hues: MODEL_COLOR,
+      width: W,
+      depth: this.d,
+      height: this.hh,
+      span: this.span,
+      backFirst: this.backFirst,
+      selected: this.sel >= 0 && this.sel < d.cols ? this.sel : -1,
+      pinned: this.pinned,
+      project: this.project,
+    });
+    const defs =
+      '<radialGradient id="bg" cx="50%" cy="38%" r="75%"><stop offset="0" stop-color="#0d1730"/>' +
+      `<stop offset="0.45" stop-color="#0a1124"/><stop offset="1" stop-color="${COLOR.bg}"/></radialGradient>`;
+    const body = `<rect width="${this.w}" height="${this.h}" fill="url(#bg)"/>` + scene.svg + notesSvg(this.buildNotes(), this.measure);
+    return svgDocument(this.w, this.h, body, {
+      defs,
+      background: COLOR.bg,
+      title: `inside-llm relief (${d.source}): ${d.cols} positions, ${d.rows} rows`,
+    });
+  }
+
+  // The relief as a PNG: the WebGL picture rendered again at `scale` times the
+  // panel's size (within what the GPU allows), with the annotations over it.
+  async exportPng(scale = 2): Promise<Blob> {
+    this.requireDrawn();
+    const w = this.w;
+    const h = this.h;
+    const pr0 = this.renderer.getPixelRatio();
+    const limit = Math.min(this.renderer.capabilities.maxTextureSize, 8192) / Math.max(w, h);
+    const pr = Math.max(1, Math.min(Math.max(pr0, 1) * scale, limit));
+    const resize = (ratio: number): void => {
+      this.renderer.setPixelRatio(ratio);
+      this.composer.setPixelRatio(ratio);
+      this.composer.setSize(w, h);
+      this.renderer.setSize(w, h, false);
+    };
+    this.camera.updateMatrixWorld();
+    let snapshot: Promise<ImageBitmap>;
+    resize(pr);
+    try {
+      this.composer.render();
+      snapshot = createImageBitmap(this.canvas); // a copy of the picture as it is now
+    } finally {
+      resize(pr0);
+      this.needs = true;
+    }
+    const under = await snapshot;
+    try {
+      const notes = svgDocument(w, h, notesSvg(this.buildNotes(), this.measure), { background: null });
+      return await svgToPngBlob(notes, w, h, pr, under);
+    } finally {
+      under.close();
+    }
+  }
+
+  // Saves the relief: "svg" or "png", named by time.
+  async save(kind: 'svg' | 'png'): Promise<void> {
+    const name = `inside-llm-relief-${this.data.source}-${stamp()}`;
+    if (kind === 'svg') downloadText(this.exportSvg(), `${name}.svg`);
+    else downloadBlob(await this.exportPng(), `${name}.png`);
+  }
+
+  private requireDrawn(): void {
+    if (this.w < 1 || this.h < 1 || !this.front.visible) throw new Error('the relief has nothing to export yet');
+  }
+
+  // ------------------------------------------------------------- pointer
+
+  // The cell of the surface under a point of the canvas, if any: its column
+  // (position) and nearest row.
+  private pick(ex: number, ey: number): { col: number; row: number } | null {
+    const d = this.data;
+    if (!this.front.visible || this.w < 1 || this.h < 1 || d.cols < 1) return null;
+    this.ndc.set((ex / this.w) * 2 - 1, -(ey / this.h) * 2 + 1);
+    this.ray.setFromCamera(this.ndc, this.camera);
+    const geo = this.front.geometry;
+    if (this.pickStale) {
+      geo.boundingSphere = null; // the heights changed since the last pick
+      geo.boundingBox = null;
+      this.pickStale = false;
+    }
+    this.grid.updateMatrixWorld(true); // place() may have moved it since the last frame
+    const hit = this.ray.intersectObject(this.front, false)[0];
+    if (!hit) return null;
+    const col = Math.min(Math.max(Math.floor(((hit.point.x + W / 2) * this.span) / W), 0), d.cols - 1);
+    const dz = this.d / Math.max(d.rows - 1, 1);
+    const k = this.backFirst ? (hit.point.z + this.d / 2) / dz : (this.d / 2 - hit.point.z) / dz;
+    return { col, row: Math.min(Math.max(Math.round(k), 0), d.rows - 1) };
+  }
+
+  // Over the surface the Stream and the Timeline follow, as when sweeping
+  // either of them; a card says what is under the pointer.
+  // Position of a pointer event in CSS px of the canvas, from its box (not
+  // offsetX, which follows the target's own transforms).
+  private local(e: PointerEvent): { x: number; y: number } {
+    const r = this.canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+
+  private readonly onPointerMove = (e: PointerEvent): void => {
+    if (e.buttons !== 0) {
+      // Dragging: the camera, not the inspection.
+      this.pending = null;
+      if (this.hover) {
+        this.hover = null;
+        this.needs = true;
+      }
+      return;
+    }
+    // One pick per frame, for the last position: a raycast over the whole
+    // surface is not free.
+    this.pending = e;
+    if (this.pickFrame === 0) this.pickFrame = requestAnimationFrame(this.inspect);
+  };
+
+  private readonly inspect = (): void => {
+    this.pickFrame = 0;
+    const e = this.pending;
+    this.pending = null;
+    if (!e) return;
+    const at = this.local(e);
+    const hit = this.pick(at.x, at.y);
+    const had = this.hover !== null;
+    this.hover = hit ? { ...hit, x: at.x, y: at.y } : null;
+    this.view.setHover(hit ? hit.col : null);
+    if (hit || had) this.needs = true;
+  };
+
+  private readonly onPointerLeave = (): void => {
+    this.down = null;
+    this.pending = null;
+    if (this.hover) {
+      this.hover = null;
+      this.needs = true;
+    }
+    this.view.setHover(null);
+  };
+
+  private readonly onPointerDown = (e: PointerEvent): void => {
+    // A second finger (a pinch) is not a click.
+    this.down = e.button === 0 && e.isPrimary ? this.local(e) : null;
+  };
+
+  // A click that did not drag pins the position, like on the Timeline.
+  private readonly onPointerUp = (e: PointerEvent): void => {
+    const down = this.down;
+    this.down = null;
+    const at = this.local(e);
+    if (!down || !e.isPrimary || e.button !== 0 || Math.hypot(at.x - down.x, at.y - down.y) > 4) return;
+    const hit = this.pick(at.x, at.y);
+    if (!hit) return;
+    if (this.view.pinnedIndex() === hit.col) this.view.unpin();
+    else this.view.pin(hit.col);
+  };
+
+  // ---------------------------------------------------------- annotations
+
+  // Text widths are asked for on every frame the camera moves: measured once.
+  private readonly widths = new Map<string, number>();
+
+  private readonly measure: Measure = (text, size, mono) => {
+    const key = `${size}${mono ? 'm' : 'u'}${text}`;
+    let w = this.widths.get(key);
+    if (w === undefined) {
+      this.measureCtx ??= document.createElement('canvas').getContext('2d');
+      const ctx = this.measureCtx;
+      if (ctx) {
+        ctx.font = `${size}px ${mono ? FONT : FONT_UI}`;
+        w = ctx.measureText(text).width;
+      } else {
+        w = estimateWidth(text, size, mono);
+      }
+      if (this.widths.size > 2000) this.widths.clear();
+      this.widths.set(key, w);
+    }
+    return w;
+  };
+
+  // World → CSS px of the panel, with the distance from the camera; null
+  // behind the camera.
+  private readonly project = (x: number, y: number, z: number): readonly [number, number, number] | null => {
+    this.v.set(x, y, z);
+    const depth = this.v2.copy(this.v).sub(this.camera.position).length();
+    this.v.project(this.camera);
+    if (this.v.z > 1 || this.v.z < -1) return null;
+    return [((this.v.x + 1) / 2) * this.w, ((1 - this.v.y) / 2) * this.h, depth];
+  };
+
+  private drawNotes(): void {
+    const svg = notesSvg(this.buildNotes(), this.measure);
+    if (svg === this.lastNotes) return; // a still camera: nothing to parse again
+    this.lastNotes = svg;
+    this.notesEl.innerHTML = svg;
+  }
+
+  private tokenText(id: number, max = LABEL_CHARS): string {
+    const v = this.store.vocab.get(id);
+    const text = v ? showWhitespace(tokenLabel(v.bytes)) : `#${id}`;
+    const chars = Array.from(text);
+    return chars.length > max ? chars.slice(0, max - 1).join('') + '…' : text;
+  }
+
+  // Everything that lies over the picture, for the camera as it is.
+  private buildNotes(): Notes {
+    const notes: Notes = { w: this.w, h: this.h, words: [], ticks: [], chips: [], cards: [] };
+    if (!this.front.visible || this.w < 1 || this.h < 1) return notes;
+    const s = this.store;
+    const d = this.data;
+    const P = this.project;
+    const layers = d.source === 'layers';
+    const ids = s.hello?.lens.layers ?? [];
+    const rows = d.rows;
+    const cols = d.cols;
+    const left = -W / 2;
+    const front = this.d / 2;
+    const inside = (p: readonly number[] | null): p is readonly [number, number, number] =>
+      p !== null && p[0] > -20 && p[0] < this.w + 20 && p[1] > -20 && p[1] < this.h + 20;
+
+    // What the rows are, along the left edge: the two ends say what they
+    // mean, the others only their number or layer.
+    const rowText = (r: number): string => {
+      const id = layers ? `L${ids[r] ?? r}` : `#${r + 1}`;
+      if (r === 0) return `${id} ${layers ? 'first layer' : 'most likely'}`;
+      if (r === rows - 1) return `${id} ${layers ? 'last layer' : 'least likely'}`;
+      return id;
+    };
+    for (let r = 0; r < rows; r++) {
+      const end = r === 0 || r === rows - 1;
+      if (!end && (rows > 24 || !this.info)) continue;
+      const p = P(left, 0, this.zOf(r));
+      if (!inside(p)) continue;
+      const text = rowText(r);
+      notes.words.push({
+        x: Math.max(p[0] - 10, this.measure(text, end ? 11 : 9.5, false) + 6),
+        y: p[1],
+        text,
+        anchor: 'end',
+        size: end ? 11 : 9.5,
+        color: end ? COLOR.muted : COLOR.low,
+        opacity: 0.9,
+      });
+    }
+
+    // Position ticks along the front edge, and the axis word at its end.
+    const first = P(this.xOf(0), 0, front);
+    const last = P(this.xOf(Math.max(cols - 1, 0)), 0, front);
+    if (this.info && cols > 0 && first && last) {
+      const across = Math.max(Math.abs(last[0] - first[0]), 1);
+      for (const i of tickPositions(0, cols - 1, across, 52).slice(0, 80)) {
+        const p = P(this.xOf(i), 0, front);
+        if (!inside(p)) continue;
+        const y = Math.min(p[1], this.h - 18);
+        notes.ticks.push({ x1: p[0], y1: y + 1, x2: p[0], y2: y + 5 });
+        notes.words.push({ x: p[0], y: y + 13, text: `${i}`, anchor: 'middle', size: 9.5, mono: true, color: COLOR.unlikely });
+      }
+    }
+    const end = P(W / 2, 0, front);
+    if (inside(end)) {
+      notes.words.push({ x: end[0], y: Math.min(end[1] + (this.info ? 27 : 14), this.h - 8), text: 'position →', anchor: 'end', size: 11, color: COLOR.muted, opacity: 0.85 });
+    }
+
+    // The probability ruler up the front-left corner: a height is sqrt(p).
+    if (this.info) {
+      const base = P(left, 0, front);
+      const topP = P(left, this.hh, front);
+      if (inside(base) && inside(topP)) {
+        notes.ticks.push({ x1: base[0], y1: base[1], x2: topP[0], y2: topP[1] });
+        // Row labels have the left edge first: a ruler label lying on one waits.
+        const rowWords = notes.words.filter((w) => w.anchor === 'end');
+        for (const t of rulerTicks()) {
+          const p = P(left, t.h * this.hh, front);
+          if (!inside(p)) continue;
+          if (rowWords.some((w) => Math.abs(w.y - p[1]) < 11 && Math.abs(w.x - p[0]) < 90)) continue;
+          notes.ticks.push({ x1: p[0] - 5, y1: p[1], x2: p[0], y2: p[1] });
+          notes.words.push({ x: p[0] - 8, y: p[1], text: t.label, anchor: 'end', size: 9.5, mono: true, color: COLOR.low });
+        }
+        notes.words.push({ x: topP[0] - 8, y: topP[1] - 13, text: layers ? 'answer probability' : 'probability', anchor: 'end', size: 10, color: COLOR.muted });
+      }
+    }
+
+    this.chipNotes(notes, ids);
+
+    if (this.info && this.h >= 200) {
+      const y = document.fullscreenElement ? 56 : 10;
+      notes.cards.push(this.infoCard(y, ids));
+      if (this.w >= 520 && this.h >= 360) notes.cards.push(this.legendCard(y));
+    }
+    const tip = this.info ? this.tooltipCard(ids) : null;
+    if (tip) notes.cards.push(tip);
+    return notes;
+  }
+
+  // One chip per row at the selected position, at that row's height: the
+  // layer or rank, the token, its probability and, with two models, the
+  // other's. Chips that would overlap are spread; with too many rows only
+  // every k-th keeps its chip.
+  private chipNotes(notes: Notes, ids: readonly number[]): void {
+    const s = this.store;
     const d = this.data;
     const sel = this.sel;
-    const x = this.xOf(sel);
+    if (sel < 0 || sel >= d.cols) return;
+    const dec = s.decision(sel);
+    if (!dec) return;
+    const layers = d.source === 'layers';
+    const lens = layers ? dec.lens : null;
+    const count = layers ? (lens ? Math.min(lens.topId.length, d.rows) : 0) : Math.min(d.rows, dec.nRaw);
+    if (count === 0) return;
+    const slot = d.tone[sel] as Slot;
+    const color = MODEL_COLOR[slot];
+    const otherSlot: Slot = slot === 0 ? 1 : 0;
+    const otherDec = !layers && s.twoModels && s.decisionOf(sel, slot) ? s.decisionOf(sel, otherSlot) : undefined;
     const k = sel === this.growCol ? this.growK : 1;
-    const n = this.labelRows;
-    const fit = Math.max(1, Math.floor((this.h - 8) / LABEL_GAP));
-    const stride = Math.ceil(n / fit);
-    const ys = this.labelY;
-    const order = this.labelOrder;
-    order.length = 0;
-    for (let r = 0; r < n; r++) {
-      const el = this.labels[r];
-      this.v.set(x, d.front[sel * d.rows + r] * k * this.hh, this.zOf(r)).project(this.camera);
-      if (this.v.z > 1 || (n - 1 - r) % stride !== 0) {
-        el.style.visibility = 'hidden';
-        continue;
+    const x = this.xOf(sel);
+    const kept = strideRows(count, this.h);
+    const pts: { r: number; x: number; y: number }[] = [];
+    for (const r of kept) {
+      const p = this.project(x, d.front[sel * d.rows + r] * k * this.hh, this.zOf(r));
+      if (p) pts.push({ r, x: p[0], y: p[1] });
+    }
+    const ys = spreadChips(
+      pts.map((p) => p.y),
+      this.h,
+      CHIP_GAP,
+    );
+    pts.forEach((p, i) => {
+      const r = p.r;
+      const parts: Part[] = [];
+      if (lens) {
+        parts.push({ text: `L${ids[r] ?? r}`, color: COLOR.muted, size: 10.5, bold: true });
+        parts.push({ text: this.tokenText(lens.topId[r]), color: COLOR.high, mono: true, size: 12 });
+        parts.push({ text: `${Math.round(lens.topP[r] * 100)}%`, color, size: 10.5, bold: true });
+      } else {
+        const token = dec.tokens[r];
+        parts.push({ text: `#${r + 1}`, color: COLOR.muted, size: 10.5, bold: true });
+        parts.push({ text: this.tokenText(token), color: COLOR.high, mono: true, size: 12 });
+        parts.push({ text: pctShort(dec.pRaw[r]), color, size: 10.5, bold: true });
+        if (otherDec) parts.push({ text: `${otherSlot === 0 ? 'A' : 'B'} ${pctShort(pOf(otherDec, token))}`, color: MODEL_COLOR[otherSlot], size: 10.5 });
       }
-      el.style.visibility = '';
-      this.labelX[r] = ((this.v.x + 1) / 2) * this.w;
-      ys[r] = ((1 - this.v.y) / 2) * this.h;
-      order.push(r);
+      notes.chips.push({ x: p.x, y: ys[i], parts });
+    });
+  }
+
+  // The selected position: its token, the figures of each model, how the two
+  // compare and, in Layers, where the answer settles. Without a selection, a
+  // summary of the path.
+  private infoCard(y: number, ids: readonly number[]): CardNote {
+    const s = this.store;
+    const d = this.data;
+    const sel = this.sel;
+    const small = (text: string, color: string = COLOR.muted): Part => ({ text, color, size: 10.5 });
+    const mono = (text: string, color: string = COLOR.muted): Part => ({ text, color, size: 10.5, mono: true });
+    const lines: CardNote['lines'] = [];
+    if (sel >= 0 && sel < d.cols) {
+      const title: Part[] = [
+        { text: `#${sel}`, color: COLOR.low, mono: true, size: 11 },
+        { text: `"${this.tokenText(s.token[s.path[sel]], 24)}"`, color: COLOR.high, mono: true, size: 11 },
+      ];
+      if (this.pinned) title.push(small('pinned', COLOR.low));
+      for (const slot of s.twoModels ? ([0, 1] as const) : ([0] as const)) {
+        const e = s.decisionOf(sel, slot);
+        if (e) lines.push({ swatch: MODEL_COLOR[slot], parts: [mono(modelFigures(e))] });
+      }
+      const pair = s.pairAt(sel);
+      if (pair) {
+        const [a, b] = pairFigures(pair);
+        lines.push({ parts: [mono(a)] }, { parts: [mono(b)] });
+        if (s.disagrees(sel)) lines.push({ parts: [small('the models picked differently', COLOR.dis)] });
+      }
+      const e = s.decision(sel);
+      if (d.source === 'layers' && e?.lens) {
+        const at = decisionLayer(e.lens.topId, finalTop(e));
+        lines.push({ parts: [small(at >= 0 ? `the answer settles at L${ids[at] ?? at}` : 'the answer never settles')] });
+      }
+      return { x: 12, y, title, lines };
     }
-    order.sort((a, b) => ys[a] - ys[b]);
-    for (let i = 1; i < order.length; i++) {
-      ys[order[i]] = Math.max(ys[order[i]], ys[order[i - 1]] + LABEL_GAP);
+    const generated = Math.max(0, s.path.length - s.promptLength);
+    lines.push({ parts: [mono(`${s.path.length} positions · ${s.promptLength} prompt · ${generated} generated`)] });
+    if (s.twoModels) lines.push({ parts: [mono(`${this.disagreements} where the picks differ`, this.disagreements > 0 ? COLOR.dis : COLOR.muted)] });
+    lines.push({ parts: [small('Hover the surface to inspect, click to pin.', COLOR.low)] });
+    return { x: 12, y, title: [{ text: 'Relief', color: COLOR.high, size: 11, bold: true }, small(d.source === 'layers' ? 'layers' : 'alternatives', COLOR.low)], lines };
+  }
+
+  private legendCard(y: number): CardNote {
+    const s = this.store;
+    const name = (slot: number): string => {
+      const m = s.hello?.models[slot];
+      const text = m ? `${m.name || m.file} ${m.quant}`.trim() : `model ${slot === 0 ? 'A' : 'B'}`;
+      const chars = Array.from(text);
+      return `${slot === 0 ? 'A' : 'B'} ${chars.length > 26 ? chars.slice(0, 25).join('') + '…' : text}`;
+    };
+    const small = (text: string, color: string = COLOR.muted): Part => ({ text, color, size: 10.5 });
+    const lines: CardNote['lines'] = [{ swatch: COLOR.a, parts: [small(name(0))] }];
+    if (s.twoModels) lines.push({ swatch: COLOR.b, parts: [small(name(1))] });
+    lines.push({ swatch: COLOR.high, parts: [small('white crest: the model hesitated')] });
+    if (s.twoModels) lines.push({ swatch: COLOR.dis, parts: [small('magenta: the models parted')] });
+    lines.push({ parts: [small(this.data.source === 'layers' ? 'height = √ answer probability' : 'height = √ probability', COLOR.low)] });
+    return { x: this.w - 12, y, align: 'end', lines };
+  }
+
+  // Under the pointer: the position, the row and the figures of that cell.
+  private tooltipCard(ids: readonly number[]): CardNote | null {
+    const h = this.hover;
+    const d = this.data;
+    if (!h || h.col >= d.cols) return null;
+    const s = this.store;
+    const dec = s.decision(h.col);
+    const small = (text: string, color: string = COLOR.muted): Part => ({ text, color, size: 10.5 });
+    const mono = (text: string, color: string = COLOR.high): Part => ({ text, color, size: 11, mono: true });
+    const lines: CardNote['lines'] = [];
+    if (dec && d.source === 'layers' && dec.lens && h.row < dec.lens.topId.length) {
+      const l = dec.lens;
+      lines.push({ parts: [small(`layer L${ids[h.row] ?? h.row}:`), mono(`"${this.tokenText(l.topId[h.row])}"`), small(`${pctShort(l.topP[h.row])}`)] });
+      lines.push({ parts: [small(`p of the final answer ${pctShort(l.answerP[h.row])} · ${l.entropy[h.row].toFixed(2)} bits`)] });
+    } else if (dec && h.row < dec.nRaw) {
+      lines.push({ parts: [small(`#${h.row + 1}`), mono(`"${this.tokenText(dec.tokens[h.row])}"`), small(pctShort(dec.pRaw[h.row]))] });
+      const picked = dec.tokens[dec.pick];
+      lines.push({ parts: [small(`picked "${this.tokenText(picked)}" ${pctShort(dec.pRaw[dec.pick])} · H ${dec.entropy.toFixed(2)} bits`)] });
     }
-    // Pushed past the bottom: the whole column moves up, but not past the top.
-    const last = order.length > 0 ? ys[order[order.length - 1]] - (this.h - LABEL_GAP / 2) : 0;
-    const over = order.length > 0 ? Math.min(last, ys[order[0]] - LABEL_GAP / 2) : 0;
-    for (const r of order) {
-      const py = over > 0 ? ys[r] - over : ys[r];
-      this.labels[r].style.transform = `translate(${Math.round(this.labelX[r] + LEADER + 2)}px, ${Math.round(py)}px) translateY(-50%)`;
-    }
+    const card: CardNote = {
+      x: h.x + 14,
+      y: h.y + 14,
+      title: [
+        { text: `#${h.col}`, color: COLOR.low, mono: true, size: 11 },
+        { text: `"${this.tokenText(s.token[s.path[h.col]], 20)}"`, color: COLOR.high, mono: true, size: 11 },
+      ],
+      lines,
+    };
+    const size = cardSize(card, this.measure);
+    if (card.x + size.w > this.w - 6) card.x = Math.max(6, h.x - 14 - size.w);
+    if (card.y + size.h > this.h - 6) card.y = Math.max(6, h.y - 14 - size.h);
+    return card;
   }
 }
 
@@ -1275,23 +1599,4 @@ function tint(out: Float32Array, v: number, tone: Color, doubt: number): void {
   out[v + 1] = tone.g;
   out[v + 2] = tone.b;
   out[v + 3] = doubt;
-}
-
-// The arrow of the position axis: the icon set's arrowRight, small.
-function arrowIcon(): SVGSVGElement {
-  const ns = 'http://www.w3.org/2000/svg';
-  const svg = document.createElementNS(ns, 'svg');
-  svg.setAttribute('viewBox', '0 0 24 24');
-  svg.setAttribute('width', '14');
-  svg.setAttribute('height', '14');
-  svg.setAttribute('aria-hidden', 'true');
-  const path = document.createElementNS(ns, 'path');
-  path.setAttribute('d', ICONS.arrowRight);
-  path.setAttribute('fill', 'none');
-  path.setAttribute('stroke', 'currentColor');
-  path.setAttribute('stroke-width', '1.5');
-  path.setAttribute('stroke-linecap', 'round');
-  path.setAttribute('stroke-linejoin', 'round');
-  svg.append(path);
-  return svg;
 }
